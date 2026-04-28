@@ -1,0 +1,2610 @@
+# ============================================================================
+#  Lounge Panel v2 — adapted from alaltitov/Guition-ESP32-S3-4848S040
+#
+#  IMPORTANT: Copy the assets/ folder from the repo into your ESPHome
+#  config directory (next to this YAML file) before compiling.
+#  You need:  assets/fonts/  assets/images/weather/  assets/images/light/
+# ============================================================================
+
+esphome:
+  name: "guition-esp32-s3-4848s040v3"
+  friendly_name: "Lounge-Panelv3"
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: time_update
+
+esp32:
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+
+api:
+  encryption:
+    key: !secret encryption_key
+  on_client_connected:
+    - lambda: |-
+        lv_label_set_text(id(ha_status), "\U000F07D0");
+        lv_obj_set_style_text_color(id(ha_status), lv_color_hex(0x5CA848), LV_PART_MAIN);
+  on_client_disconnected:
+    - lambda: |-
+        lv_obj_set_style_text_color(id(ha_status), lv_color_hex(0x606682), LV_PART_MAIN);
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "4848s040 Fallback"
+    password: !secret ota_password
+  on_connect:
+    - script.execute: update_wifi_icon
+  on_disconnect:
+    - lambda: |-
+        lv_label_set_text(id(wifi_status), "\U0000e931");
+        lv_obj_set_style_text_color(id(wifi_status), lv_color_hex(0x606682), LV_PART_MAIN);
+
+captive_portal:
+
+# ─── Bluetooth Proxy ──────────────────────────────────────────────────────────
+# Forwards BLE advertisements + active connections to Home Assistant.
+# Conservative settings tuned for a panel that also runs an LVGL UI:
+#   - 3 active connection slots (default; max 5 recommended)
+#   - active scanning ON so HA can discover new devices
+#   - BLE/WiFi share the 2.4 GHz radio so expect a small WiFi throughput hit
+# RAM impact: ~30 KB for the BLE stack + ~1 KB per connection slot.
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+    interval: 1100ms
+    window: 1100ms
+
+bluetooth_proxy:
+  active: true
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+    on_begin:
+      - lambda: id(backlight_output).set_level(0.0);
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: "Europe/London"
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+    on_time_sync:
+      - script.execute: time_update
+    on_time:
+      - minutes: '*'
+        seconds: 0
+        then:
+          - script.execute: time_update
+          # Night mode: 00:00–05:59 → force 1 min timeout; 06:00+ → restore user pref
+          - lambda: |-
+              if (!id(night_mode_enabled)) return;
+              auto now = id(sntp_time).now();
+              if (!now.is_valid()) return;
+              auto call = id(display_timeout_backlight).make_call();
+              if (now.hour < 6) {
+                call.set_value(1);
+              } else {
+                call.set_value(id(user_sleep_minutes));
+              }
+              call.perform();
+
+# ─── Globals ──────────────────────────────────────────────────────────────────
+globals:
+  # 0=HOME  1=WEATHER  2=INFO  3=SETTINGS
+  - id: current_mode
+    type: int
+    initial_value: '0'
+  - id: target_setpoint
+    type: float
+    restore_value: false
+    initial_value: "20.0"
+  # Which light is selected on the light page: 0=lamp 1=main 2=display
+  - id: selected_light_idx
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: display_timeout_val
+    type: int
+    restore_value: true
+    initial_value: '0'
+  # User's preferred sleep timeout in minutes (5/10/15/30)
+  - id: user_sleep_minutes
+    type: int
+    restore_value: true
+    initial_value: '5'
+  # Night mode: between 00:00–06:00, dim then off after 1 min idle
+  - id: night_mode_enabled
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+
+# ─── On-device Relays ─────────────────────────────────────────────────────────
+switch:
+  - platform: gpio
+    name: "Relay 1"
+    id: relay_1
+    pin: { number: GPIO40, inverted: true }
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: gpio
+    name: "Relay 2"
+    id: relay_2
+    pin: { number: GPIO2, inverted: true }
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: gpio
+    name: "Relay 3"
+    id: relay_3
+    pin: { number: GPIO1, inverted: true }
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# ─── HA Light state listeners ─────────────────────────────────────────────────
+binary_sensor:
+  - platform: homeassistant
+    id: ha_lounge_lamp
+    entity_id: light.lounge_lamp
+    on_state:
+      then:
+        - lambda: |-
+            uint32_t c = x ? 0xF4A900 : 0x606682;
+            lv_obj_set_style_text_color(id(light_btn_0_icon), lv_color_hex(c), LV_PART_MAIN);
+  - platform: homeassistant
+    id: ha_lounge_main
+    entity_id: light.lounge_main
+    on_state:
+      then:
+        - lambda: |-
+            uint32_t c = x ? 0xF4A900 : 0x606682;
+            lv_obj_set_style_text_color(id(light_btn_1_icon), lv_color_hex(c), LV_PART_MAIN);
+  - platform: homeassistant
+    id: ha_display_case
+    entity_id: light.display_display_case
+    on_state:
+      then:
+        - lambda: |-
+            uint32_t c = x ? 0xF4A900 : 0x606682;
+            lv_obj_set_style_text_color(id(light_btn_2_icon), lv_color_hex(c), LV_PART_MAIN);
+  - platform: status
+    name: "Device Status"
+
+# ─── Sensors ──────────────────────────────────────────────────────────────────
+sensor:
+  # Outside temperature — home circle + weather page
+  - platform: homeassistant
+    id: ha_alley_temp
+    entity_id: sensor.alleytemp_temperature
+    on_value:
+      - lvgl.label.update:
+          id: circle_home_outside_value
+          text: !lambda |-
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.1f°", x);
+            return std::string(buf);
+
+  # Outside pressure — shown on weather page below the condition text
+  - platform: homeassistant
+    id: ha_alley_pressure
+    entity_id: sensor.alleytemp_pressure
+    on_value:
+      - lvgl.label.update:
+          id: weather_outside_pressure_value
+          text: !lambda |-
+            char buf[24];
+            snprintf(buf, sizeof(buf), "%.0f hPa", x);
+            return std::string(buf);
+
+  # Hallway temperature — home circle
+  - platform: homeassistant
+    id: ha_hallway_temp
+    entity_id: sensor.hallway_temperature
+    on_value:
+      - lvgl.label.update:
+          id: circle_home_temp_value
+          text: !lambda |-
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.1f°", x);
+            return std::string(buf);
+
+  # Climate sensors
+  - platform: homeassistant
+    id: ha_climate_current
+    entity_id: climate.hallway
+    attribute: current_temperature
+    on_value:
+      - lvgl.label.update:
+          id: climate_current_temperature_label
+          text: !lambda |-
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%.1f", x);
+            return std::string(buf);
+      - lvgl.arc.update:
+          id: climate_arc_current_temperature
+          value: !lambda return (int)(x * 2 + 0.5f);
+
+  - platform: homeassistant
+    id: ha_climate_target
+    entity_id: climate.hallway
+    attribute: temperature
+    on_value:
+      - globals.set:
+          id: target_setpoint
+          value: !lambda "return x;"
+      - lvgl.arc.update:
+          id: climate_arc_base_heat
+          value: !lambda return (int)(x * 2 + 0.5f);
+      - lvgl.label.update:
+          id: climate_target_temperature_label
+          text: !lambda |-
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%.1f", x);
+            return std::string(buf);
+
+  # Weather
+  - platform: homeassistant
+    id: ha_weather_temp
+    entity_id: weather.forecast_home
+    attribute: temperature
+    on_value:
+      - lvgl.label.update:
+          id: weather_temperature_value
+          text: !lambda |-
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%.0f°", x);
+            return std::string(buf);
+
+  - platform: homeassistant
+    id: ha_weather_humidity
+    entity_id: weather.forecast_home
+    attribute: humidity
+    on_value:
+      - lvgl.label.update:
+          id: weather_humidity_value
+          text: !lambda |-
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%.0f%%", x);
+            return std::string(buf);
+
+  - platform: homeassistant
+    id: ha_weather_wind
+    entity_id: weather.forecast_home
+    attribute: wind_speed
+    on_value:
+      - lvgl.label.update:
+          id: weather_wind_speed_value
+          text: !lambda |-
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%.1f ", x);
+            return std::string(buf);
+
+  # Internal chip temperature — info circle
+  - platform: internal_temperature
+    name: "ESP32 Internal Temperature"
+    id: esp32_temperature
+    update_interval: 30s
+    on_value:
+      - lvgl.label.update:
+          id: circle_info_cpu_value
+          text: !lambda |-
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%.1f°", x);
+            return std::string(buf);
+
+  # WiFi signal
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: sensor_wifi_signal
+    update_interval: 30s
+    on_value:
+      - lvgl.label.update:
+          id: wifi_signal_info_state
+          text: !lambda |-
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.1f dBm", x);
+            return std::string(buf);
+
+  - platform: wifi_signal
+    id: wifi_signal_percent
+    update_interval: 30s
+    filters:
+      - lambda: return min(max(2 * (x + 100.0), 0.0), 100.0);
+    unit_of_measurement: "%"
+    internal: true
+    on_value:
+      - script.execute: update_wifi_icon
+
+  - platform: uptime
+    name: "Uptime"
+    id: sensor_uptime
+    update_interval: 60s
+
+  # Light brightness
+  - platform: homeassistant
+    id: ha_light_brightness
+    entity_id: light.lounge_lamp
+    attribute: brightness
+    on_value:
+      - if:
+          condition:
+            lambda: "return id(selected_light_idx) == 0;"
+          then:
+            - lvgl.slider.update:
+                id: light_brightness_slider
+                value: !lambda return (int)(x / 2.55f);
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      id: sensor_ip
+      on_value:
+        - lvgl.label.update:
+            id: ip_address_info_state
+            text: !lambda "return x;"
+    ssid:
+      name: "Connected SSID"
+    mac_address:
+      name: "MAC Address"
+      id: sensor_mac
+      on_value:
+        - lvgl.label.update:
+            id: mac_address_info_state
+            text: !lambda "return x;"
+  - platform: version
+    name: "ESPHome Version"
+    id: sensor_version
+    on_value:
+      - lvgl.label.update:
+          id: esphome_version_info_state
+          text: !lambda "return x;"
+
+  # Climate mode
+  - platform: homeassistant
+    id: ha_climate_mode
+    entity_id: climate.hallway
+    on_value:
+      - lambda: |-
+          std::string m = x;
+          bool is_heat = (m == "heat");
+
+          // State label
+          std::string d = m;
+          if (!d.empty()) d[0] = toupper(d[0]);
+          lv_label_set_text(id(climate_state_label), d.c_str());
+
+          // Arc + label colours
+          uint32_t arc_col = is_heat ? 0xFF6600 : 0x606682;
+          lv_obj_set_style_arc_color(id(climate_arc_base_heat),
+            lv_color_hex(arc_col), LV_PART_INDICATOR);
+          lv_obj_set_style_text_color(id(climate_target_temperature_label),
+            lv_color_hex(is_heat ? 0xF4A900 : 0x9BA2BC), LV_PART_MAIN);
+
+          // Mode button highlights
+          lv_obj_set_style_text_color(id(climate_heat_mode_icon),
+            lv_color_hex(is_heat ? 0xFF6600 : 0x9BA2BC), LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(climate_off_mode_icon),
+            lv_color_hex(!is_heat ? 0x9BA2BC : 0x606682), LV_PART_MAIN);
+
+  # Weather state
+  - platform: homeassistant
+    id: ha_weather_condition
+    entity_id: weather.forecast_home
+    on_value:
+      - script.execute: update_weather_image
+
+# ─── Backlight ────────────────────────────────────────────────────────────────
+output:
+  - platform: ledc
+    id: backlight_output
+    pin: GPIO38
+    frequency: 150Hz
+    min_power: 0.01
+    zero_means_zero: true
+
+light:
+  - platform: monochromatic
+    name: "Backlight"
+    id: display_backlight
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+    default_transition_length: 1s
+
+# ─── SPI ──────────────────────────────────────────────────────────────────────
+spi:
+  - id: lcd_spi
+    clk_pin: GPIO48
+    mosi_pin: GPIO47
+
+# ─── I2C ──────────────────────────────────────────────────────────────────────
+i2c:
+  id: touchscreen_bus
+  sda: GPIO19
+  scl:
+    number: GPIO45
+    ignore_strapping_warning: true
+
+# ─── Display ──────────────────────────────────────────────────────────────────
+display:
+  - platform: st7701s
+    id: tft_display
+    dimensions: { width: 480, height: 480 }
+    spi_mode: MODE3
+    data_rate: 2MHz
+    color_order: RGB
+    invert_colors: false
+    cs_pin: GPIO39
+    de_pin: GPIO18
+    hsync_pin: GPIO16
+    vsync_pin: GPIO17
+    pclk_pin: GPIO21
+    pclk_frequency: 12MHz
+    pclk_inverted: false
+    hsync_pulse_width: 8
+    hsync_front_porch: 10
+    hsync_back_porch: 20
+    vsync_pulse_width: 8
+    vsync_front_porch: 10
+    vsync_back_porch: 10
+    update_interval: never
+    auto_clear_enabled: false
+    init_sequence:
+      - 1
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x10]
+      - [0xCD, 0x00]
+    data_pins:
+      red:   [11, 12, 13, 14,  0]
+      green: [ 8, 20,  3, 46,  9, 10]
+      blue:  [ 4,  5,  6,  7, 15]
+
+# ─── Touchscreen ──────────────────────────────────────────────────────────────
+touchscreen:
+  - platform: gt911
+    id: tft_touch
+    display: tft_display
+    transform:
+      swap_xy: false
+      mirror_x: false
+    on_touch:
+      # Wake the display on any touch.
+      # lvgl.resume must come first — while LVGL is paused it cannot
+      # process touch events, so the resume call happens unconditionally
+      # via the touchscreen driver before LVGL sees the event.
+      - lvgl.resume:
+      - light.turn_on:
+          id: display_backlight
+          brightness: 100%
+          transition_length: 300ms
+      - lvgl.widget.redraw:
+
+# ─── Backlight timeout number ─────────────────────────────────────────────────
+number:
+  - platform: template
+    id: display_timeout_backlight
+    name: "Backlight timeout"
+    optimistic: true
+    unit_of_measurement: "m"
+    initial_value: 5
+    restore_value: true
+    min_value: -1
+    max_value: 720
+    step: 1
+    mode: box
+
+# ─── Scripts ──────────────────────────────────────────────────────────────────
+script:
+
+  # ── Clock update ────────────────────────────────────────────────────────────
+  - id: time_update
+    mode: queued
+    then:
+      - lambda: |-
+          auto now = id(sntp_time).now();
+          if (!now.is_valid()) return;
+
+          char tbuf[6];
+          snprintf(tbuf, sizeof(tbuf), "%02d:%02d", now.hour, now.minute);
+          lv_label_set_text(id(time_value), tbuf);
+
+          // Day of week
+          const char* days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+          lv_label_set_text(id(day_of_week_value), days[now.day_of_week - 1]);
+
+          // Date
+          const char* months[] = {"January","February","March","April","May","June",
+                                   "July","August","September","October","November","December"};
+          char dbuf[32];
+          snprintf(dbuf, sizeof(dbuf), "%02d, %s", now.day_of_month, months[now.month - 1]);
+          lv_label_set_text(id(date_month_value), dbuf);
+
+  # ── WiFi icon update ────────────────────────────────────────────────────────
+  - id: update_wifi_icon
+    then:
+      - lambda: |-
+          float pct = id(wifi_signal_percent).state;
+          const char* icon;
+          if      (pct > 75) icon = "\U0000e934";
+          else if (pct > 50) icon = "\U0000e933";
+          else if (pct > 25) icon = "\U0000e932";
+          else               icon = "\U0000e931";
+          lv_label_set_text(id(wifi_status), icon);
+          lv_obj_set_style_text_color(id(wifi_status), lv_color_hex(0x5CA848), LV_PART_MAIN);
+
+  # ── Weather image show/hide ──────────────────────────────────────────────────
+  - id: update_weather_image
+    then:
+      - lambda: |-
+          std::string w = id(ha_weather_condition).state;
+
+          lv_obj_add_flag(id(weather_sunny_image),              LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_clear_night_image),        LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_cloudy_image),             LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_partlycloudy_sun_image),   LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_partlycloudy_moon_image),  LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_rainy_image),              LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_pouring_image),            LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_snowy_image),              LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_snowy_rainy_image),        LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_fog_image),                LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_hail_image),               LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_lightning_image),          LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_lightning_rainy_image),    LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_windy_image),              LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(weather_windy_variant_image),      LV_OBJ_FLAG_HIDDEN);
+
+          // Also update condition text
+          std::string cond = w;
+          if      (w == "clear-night")     cond = "Clear Night";
+          else if (w == "cloudy")          cond = "Cloudy";
+          else if (w == "fog")             cond = "Foggy";
+          else if (w == "hail")            cond = "Hail";
+          else if (w == "lightning")       cond = "Lightning";
+          else if (w == "lightning-rainy") cond = "Thunderstorm";
+          else if (w == "partlycloudy")    cond = "Partly Cloudy";
+          else if (w == "pouring")         cond = "Heavy Rain";
+          else if (w == "rainy")           cond = "Rainy";
+          else if (w == "snowy")           cond = "Snowy";
+          else if (w == "snowy-rainy")     cond = "Sleet";
+          else if (w == "sunny")           cond = "Sunny";
+          else if (w == "windy")           cond = "Windy";
+          else if (w == "windy-variant")   cond = "Windy";
+          lv_label_set_text(id(weather_state_label), cond.c_str());
+
+          bool is_night = false;
+          if (w == "clear-night") {
+            lv_obj_clear_flag(id(weather_clear_night_image), LV_OBJ_FLAG_HIDDEN);
+          } else if (w == "cloudy") {
+            lv_obj_clear_flag(id(weather_cloudy_image), LV_OBJ_FLAG_HIDDEN);
+          } else if (w == "partlycloudy") {
+            lv_obj_clear_flag(id(weather_partlycloudy_sun_image), LV_OBJ_FLAG_HIDDEN);
+          } else if (w == "rainy") {
+            lv_obj_clear_flag(id(weather_rainy_image), LV_OBJ_FLAG_HIDDEN);
+          } else if (w == "pouring") {
+            lv_obj_clear_flag(id(weather_pouring_image), LV_OBJ_FLAG_HIDDEN);
+          } else if (w == "snowy") {
+            lv_obj_clear_flag(id(weather_snowy_image), LV_OBJ_FLAG_HIDDEN);
+          } else if (w == "snowy-rainy") {
+            lv_obj_clear_flag(id(weather_snowy_rainy_image), LV_OBJ_FLAG_HIDDEN);
+          } else if (w == "fog") {
+            lv_obj_clear_flag(id(weather_fog_image), LV_OBJ_FLAG_HIDDEN);
+          } else if (w == "hail") {
+            lv_obj_clear_flag(id(weather_hail_image), LV_OBJ_FLAG_HIDDEN);
+          } else if (w == "lightning") {
+            lv_obj_clear_flag(id(weather_lightning_image), LV_OBJ_FLAG_HIDDEN);
+          } else if (w == "lightning-rainy") {
+            lv_obj_clear_flag(id(weather_lightning_rainy_image), LV_OBJ_FLAG_HIDDEN);
+          } else if (w == "windy") {
+            lv_obj_clear_flag(id(weather_windy_image), LV_OBJ_FLAG_HIDDEN);
+          } else if (w == "windy-variant") {
+            lv_obj_clear_flag(id(weather_windy_variant_image), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_clear_flag(id(weather_sunny_image), LV_OBJ_FLAG_HIDDEN);
+          }
+
+  # ── Mode switcher ────────────────────────────────────────────────────────────
+  # Hides/shows the main card sub-widgets and middle row controls
+  - id: switch_to_mode
+    parameters:
+      target_mode: int
+    then:
+      - lambda: |-
+          id(current_mode) = target_mode;
+
+          // Main card sub-widgets
+          if (target_mode == 0) { // HOME
+            lv_obj_clear_flag(id(weather_time_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(datetime_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(weather_state_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(info_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(settings_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(weather_state_images), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(middle_home_controls), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(middle_weather_controls), LV_OBJ_FLAG_HIDDEN);
+            // Circle
+            lv_obj_clear_flag(id(circle_home_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(circle_info_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(circle_widget_background), LV_OBJ_FLAG_HIDDEN);
+          } else if (target_mode == 1) { // WEATHER
+            lv_obj_clear_flag(id(weather_time_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(datetime_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(weather_state_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(info_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(settings_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(weather_state_images), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(middle_home_controls), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(middle_weather_controls), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(circle_home_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(circle_info_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(circle_widget_background), LV_OBJ_FLAG_HIDDEN);
+          } else if (target_mode == 2) { // INFO
+            lv_obj_add_flag(id(weather_time_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(datetime_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(weather_state_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(info_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(settings_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(weather_state_images), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(middle_home_controls), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(middle_weather_controls), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(circle_home_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(circle_info_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(circle_widget_background), LV_OBJ_FLAG_HIDDEN);
+          } else if (target_mode == 3) { // SETTINGS
+            lv_obj_add_flag(id(weather_time_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(datetime_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(weather_state_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(info_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(settings_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(weather_state_images), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(middle_home_controls), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(middle_weather_controls), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(circle_home_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(circle_info_widget), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(circle_widget_background), LV_OBJ_FLAG_HIDDEN);
+          }
+
+# ─── Fonts ────────────────────────────────────────────────────────────────────
+font:
+
+  # Nunito SemiBold — primary UI font (from repo assets)
+  - file: "assets/fonts/Nunito-SemiBold.ttf"
+    id: nunito_16
+    size: 16
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+
+  - file: "assets/fonts/Nunito-SemiBold.ttf"
+    id: nunito_18
+    size: 18
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+
+  - file: "assets/fonts/Nunito-SemiBold.ttf"
+    id: nunito_20
+    size: 20
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+
+  - file: "assets/fonts/Nunito-SemiBold.ttf"
+    id: nunito_30
+    size: 30
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+
+  - file: "assets/fonts/Nunito-SemiBold.ttf"
+    id: nunito_48
+    size: 48
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+
+  - file: "assets/fonts/Nunito-SemiBold.ttf"
+    id: nunito_56
+    size: 56
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+
+  - file: "assets/fonts/Nunito-SemiBold.ttf"
+    id: nunito_64
+    size: 64
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+
+  # Custom icon font (from repo assets)
+  - file: "assets/fonts/icons_v2.ttf"
+    id: icons_24
+    size: 24
+    bpp: 4
+    glyphs: [
+      "\U0000e92e",  # lock
+      "\U0000e925",  # thermostat
+      "\U0000e93b",  # air conditioner
+      "\U0000e936",  # heating
+      "\U0000e935",  # home assistant
+      "\U0000e931",  # wifi 25%
+      "\U0000e932",  # wifi 50%
+      "\U0000e933",  # wifi 75%
+      "\U0000e934",  # wifi 100%
+      "\U0000e938",  # humidity
+    ]
+
+  - file: "assets/fonts/icons_v2.ttf"
+    id: icons_28
+    size: 28
+    bpp: 4
+    glyphs: [
+      "\U0000e938",  # humidity
+      "\U0000e939",  # temperature
+      "\U0000e908",  # lightbulb
+      "\U0000e915",  # desk lamp
+      "\U0000e916",  # spotlight group
+      "\U0000e917",  # pendant lamp
+      "\U0000e921",  # ceiling lamp variant
+      "\U0000e92e",  # lock
+      "\U0000e902",  # exit
+    ]
+
+  - file: "assets/fonts/icons_v2.ttf"
+    id: icons_36
+    size: 36
+    bpp: 4
+    glyphs: [
+      "\U0000e903",  # settings
+      "\U0000e904",  # info
+      "\U0000e905",  # devices
+      "\U0000e906",  # home
+      "\U0000e907",  # ceiling
+      "\U0000e908",  # lightbulb
+    ]
+
+  # Material Design Icons
+  - file: "assets/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_icons_24
+    size: 24
+    bpp: 4
+    glyphs: [
+      "\U000F07D0",  # home assistant
+      "\U000F068A",  # shield home
+    ]
+
+  - file: "assets/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_icons_28
+    size: 28
+    bpp: 4
+    glyphs: [
+      "\U000F0238",  # heat / fire
+      "\U000F0425",  # off / power off
+      "\U000F0341",  # display lock
+      "\U000F1A4D",  # display brightness
+      "\U000F1C70",  # display info
+      "\U000F08BB",  # display settings
+      "\U000F06A1",  # display home
+      "\U000F18F6",  # display weather
+      "\U000F18DD",  # ceiling lights
+      "\U000F056E",  # devices
+      "\U000F050F",  # thermometer
+      "\U000F0131",  # checkbox-blank-outline
+      "\U000F0132",  # checkbox-marked
+    ]
+
+  - file: "assets/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_icons_40
+    size: 40
+    bpp: 4
+    glyphs: [
+      "\U000F0415",  # plus
+      "\U000F0374",  # minus
+    ]
+
+# ─── Images ───────────────────────────────────────────────────────────────────
+image:
+  - file: "assets/images/weather/windsock.png"
+    id: windsock_img
+    type: rgb565
+    resize: 56x25
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/sunny.png"
+    id: sunny_img
+    type: rgb565
+    resize: 100x100
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/clear_night.png"
+    id: clear_night_img
+    type: rgb565
+    resize: 100x100
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/cloudy.png"
+    id: cloudy_img
+    type: rgb565
+    resize: 100x100
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/partlycloudy_sun.png"
+    id: partlycloudy_sun_img
+    type: rgb565
+    resize: 100x100
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/partlycloudy_moon.png"
+    id: partlycloudy_moon_img
+    type: rgb565
+    resize: 100x100
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/rainy.png"
+    id: rainy_img
+    type: rgb565
+    resize: 100x100
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/pouring.png"
+    id: pouring_img
+    type: rgb565
+    resize: 100x100
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/snowy.png"
+    id: snowy_img
+    type: rgb565
+    resize: 100x100
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/snowy_rainy.png"
+    id: snowy_rainy_img
+    type: rgb565
+    resize: 100x100
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/fog.png"
+    id: fog_img
+    type: rgb565
+    resize: 80x80
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/hail.png"
+    id: hail_img
+    type: rgb565
+    resize: 100x100
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/lightning.png"
+    id: lightning_img
+    type: rgb565
+    resize: 100x100
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/lightning_rainy.png"
+    id: lightning_rainy_img
+    type: rgb565
+    resize: 100x100
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/windy.png"
+    id: windy_img
+    type: rgb565
+    resize: 90x90
+    transparency: alpha_channel
+
+  - file: "assets/images/weather/windy_variant.png"
+    id: windy_variant_img
+    type: rgb565
+    resize: 100x100
+    transparency: alpha_channel
+
+# ============================================================================
+# LVGL
+# ============================================================================
+#
+#  Three pages:
+#    home_page   — single page with 4 sub-modes (HOME/WEATHER/INFO/SETTINGS)
+#    light_page  — controls for lounge lamp / main / display case
+#    climate_page — hallway thermostat with arc dial
+#
+#  Color palette (alaltitov style):
+#    bg            #0d0d0d   near-black
+#    card          #343645   slate blue-gray
+#    text          #9BA2BC   misty blue
+#    steel         #606682   steel blue (inactive icons)
+#    amber         #f4a900   active accent
+#    sky           #3FA7F3   info accent
+#    deep_orange   #ff6600   heat arc
+#
+# ============================================================================
+
+lvgl:
+  displays:
+    - tft_display
+  touchscreens:
+    - tft_touch
+  rotation: 0
+  color_depth: 16
+  bg_color: 0x0d0d0d
+  default_font: nunito_20
+
+  on_idle:
+    timeout: !lambda "return (int)(id(display_timeout_backlight).state * 60 * 1000);"
+    then:
+      - if:
+          condition:
+            lambda: "return id(display_timeout_backlight).state >= 0;"
+          then:
+            - light.turn_off:
+                id: display_backlight
+                transition_length: 2s
+            # Do NOT call lvgl.pause here — pausing LVGL stops it processing
+            # touch events, which means on_touch never fires to wake the screen.
+            # The backlight off is sufficient; LVGL keeps running in the dark.
+
+  pages:
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HOME PAGE  (modes: 0=HOME  1=WEATHER  2=INFO  3=SETTINGS)
+    # ══════════════════════════════════════════════════════════════════════════
+    - id: home_page
+      bg_color: 0x0d0d0d
+      scrollable: false
+
+      widgets:
+
+        # ── Top status indicator bar ──────────────────────────────────────────
+        - obj:
+            id: home_bg_indicators
+            y: 10
+            width: 460
+            height: 40
+            align: top_mid
+            pad_all: 0
+            bg_opa: transp
+            border_opa: transp
+            shadow_opa: transp
+            widgets:
+
+              - label:
+                  id: wifi_status
+                  align: left_mid
+                  x: 20
+                  text: "\U0000e934"
+                  text_color: 0x606682
+                  text_font: icons_24
+
+              - label:
+                  id: ha_status
+                  align: left_mid
+                  x: 60
+                  text: "\U000F07D0"
+                  text_color: 0x606682
+                  text_font: mdi_icons_24
+
+
+
+        # ── Main card ─────────────────────────────────────────────────────────
+        - obj:
+            id: main_widget_background
+            y: 60
+            width: 440
+            height: 220
+            align: top_mid
+            clickable: false
+            scrollable: false
+            radius: 20
+            pad_all: 0
+            bg_color: 0x343645
+            border_opa: transp
+            shadow_opa: transp
+            widgets:
+
+              # ── Weather + time header row ──────────────────────────────────
+              - obj:
+                  id: weather_time_widget
+                  hidden: false
+                  width: 440
+                  height: 80
+                  align: top_mid
+                  clickable: false
+                  scrollable: false
+                  radius: 20
+                  pad_all: 0
+                  bg_opa: transp
+                  border_opa: transp
+                  shadow_opa: transp
+                  widgets:
+                    - label:
+                        id: weather_temperature_value
+                        x: 30
+                        y: 10
+                        align: top_left
+                        text_font: nunito_48
+                        text_color: 0x9BA2BC
+                        text: "—°"
+
+                    - label:
+                        id: weather_humidity_value
+                        x: -60
+                        y: 10
+                        align: top_right
+                        text_font: nunito_18
+                        text_color: 0x9BA2BC
+                        text: " "
+
+                    - label:
+                        id: weather_humidity_icon
+                        x: -30
+                        y: 10
+                        align: top_right
+                        text_font: icons_24
+                        text_color: 0x4C9FFF
+                        text: "\U0000e938"
+
+                    - label:
+                        id: weather_wind_speed_value
+                        x: -80
+                        y: 42
+                        align: top_right
+                        text_font: nunito_18
+                        text_color: 0x9BA2BC
+                        text: " "
+
+                    - label:
+                        id: weather_wind_unit_label
+                        x: -48
+                        y: 42
+                        align: top_right
+                        text_font: nunito_18
+                        text_color: 0x9BA2BC
+                        text: "km/h"
+
+                    - image:
+                        id: weather_wind_speed_image
+                        y: 44
+                        x: -12
+                        align: top_right
+                        src: windsock_img
+
+                    - obj:
+                        id: weather_time_widget_line
+                        y: -5
+                        width: 400
+                        height: 2
+                        align: bottom_mid
+                        bg_color: 0x606682
+                        border_opa: transp
+                        shadow_opa: transp
+
+              # ── Clock (HOME mode) ──────────────────────────────────────────
+              - obj:
+                  id: datetime_widget
+                  y: 80
+                  hidden: false
+                  width: 440
+                  height: 140
+                  align: top_mid
+                  clickable: false
+                  scrollable: false
+                  radius: 20
+                  pad_all: 0
+                  bg_opa: transp
+                  border_opa: transp
+                  shadow_opa: transp
+                  widgets:
+                    - label:
+                        id: day_of_week_value
+                        x: 40
+                        y: 105
+                        align: top_left
+                        text_font: nunito_16
+                        text_color: 0x9BA2BC
+                        text: "Monday"
+
+                    - label:
+                        id: date_month_value
+                        x: -40
+                        y: 105
+                        align: top_right
+                        text_font: nunito_16
+                        text_color: 0x9BA2BC
+                        text: "01, January"
+
+                    - label:
+                        id: time_value
+                        y: 0
+                        align: top_mid
+                        text_font: nunito_64
+                        text_color: 0x9BA2BC
+                        text: "--:--"
+
+                    - obj:
+                        id: datetime_widget_line
+                        y: -50
+                        width: 400
+                        height: 2
+                        align: bottom_mid
+                        bg_color: 0x606682
+                        border_opa: transp
+                        shadow_opa: transp
+
+              # ── Condition text (WEATHER mode) ──────────────────────────────
+              - obj:
+                  id: weather_state_widget
+                  y: 80
+                  hidden: true
+                  width: 440
+                  height: 140
+                  align: top_mid
+                  clickable: false
+                  scrollable: false
+                  radius: 20
+                  pad_all: 0
+                  bg_opa: transp
+                  border_opa: transp
+                  shadow_opa: transp
+                  widgets:
+                    - label:
+                        id: weather_state_label
+                        y: 24
+                        width: 380
+                        height: 40
+                        align: top_mid
+                        text_font: nunito_30
+                        text_color: 0x9BA2BC
+                        long_mode: CLIP
+                        text: " "
+                        text_align: center
+
+                    - label:
+                        id: weather_outside_pressure_value
+                        y: 72
+                        align: top_mid
+                        text_font: nunito_20
+                        text_color: 0x9BA2BC
+                        text: "— hPa"
+
+              # ── Info widget (INFO mode) ────────────────────────────────────
+              - obj:
+                  id: info_widget
+                  hidden: true
+                  width: 440
+                  height: 220
+                  align: top_mid
+                  clickable: false
+                  scrollable: false
+                  radius: 20
+                  pad_all: 0
+                  bg_opa: transp
+                  border_opa: transp
+                  shadow_opa: transp
+                  widgets:
+                    - label:
+                        x: 20
+                        y: 30
+                        align: top_left
+                        text_font: nunito_18
+                        text_color: 0x9BA2BC
+                        text: "WiFi Signal:"
+                    - label:
+                        id: wifi_signal_info_state
+                        x: -20
+                        y: 30
+                        align: top_right
+                        text_font: nunito_18
+                        text_color: 0x9BA2BC
+                        text: "— dBm"
+                    - label:
+                        x: 20
+                        y: 70
+                        align: top_left
+                        text_font: nunito_18
+                        text_color: 0x9BA2BC
+                        text: "IP Address:"
+                    - label:
+                        id: ip_address_info_state
+                        x: -20
+                        y: 70
+                        align: top_right
+                        text_font: nunito_18
+                        text_color: 0x9BA2BC
+                        text: "—"
+                    - label:
+                        x: 20
+                        y: 110
+                        align: top_left
+                        text_font: nunito_18
+                        text_color: 0x9BA2BC
+                        text: "MAC Address:"
+                    - label:
+                        id: mac_address_info_state
+                        x: -20
+                        y: 110
+                        align: top_right
+                        text_font: nunito_18
+                        text_color: 0x9BA2BC
+                        text: "—"
+                    - label:
+                        x: 20
+                        y: 150
+                        align: top_left
+                        text_font: nunito_18
+                        text_color: 0x9BA2BC
+                        text: "ESPHome Version:"
+                    - label:
+                        id: esphome_version_info_state
+                        x: -20
+                        y: 150
+                        align: top_right
+                        text_font: nunito_18
+                        text_color: 0x9BA2BC
+                        text: "—"
+
+              # ── Settings widget (SETTINGS mode) ───────────────────────────
+              - obj:
+                  id: settings_widget
+                  hidden: true
+                  width: 440
+                  height: 220
+                  align: top_mid
+                  clickable: false
+                  scrollable: false
+                  radius: 20
+                  pad_all: 0
+                  bg_color: 0x343645
+                  border_opa: transp
+                  shadow_opa: transp
+                  widgets:
+                    # Backlight panel
+                    - obj:
+                        id: backlight_settings_background
+                        width: 210
+                        height: 220
+                        align: top_left
+                        clickable: false
+                        radius: 20
+                        pad_all: 0
+                        bg_color: 0x343645
+                        border_opa: transp
+                        shadow_opa: transp
+                        widgets:
+                          - label:
+                              y: 20
+                              align: top_mid
+                              text_font: nunito_18
+                              text_color: 0x9BA2BC
+                              text: "Backlight"
+                          - slider:
+                              id: backlight_settings_brightness_slider
+                              y: -20
+                              radius: 10
+                              bg_color: 0x606682
+                              align: bottom_mid
+                              width: 40
+                              height: 140
+                              min_value: 35
+                              max_value: 100
+                              value: 100
+                              indicator:
+                                bg_color: 0x9BA2BC
+                                radius: 10
+                              knob:
+                                bg_opa: transp
+                              on_release:
+                                - light.turn_on:
+                                    id: display_backlight
+                                    brightness: !lambda return x / 100.0;
+                    # Sleep time + night mode panel (right side)
+                    - obj:
+                        id: sleep_settings_background
+                        width: 210
+                        height: 220
+                        align: top_right
+                        clickable: false
+                        scrollable: false
+                        radius: 20
+                        pad_all: 0
+                        bg_color: 0x343645
+                        border_opa: transp
+                        shadow_opa: transp
+                        widgets:
+                          - label:
+                              y: 12
+                              align: top_mid
+                              text_font: nunito_16
+                              text_color: 0x9BA2BC
+                              text: "Sleep time"
+
+                          # ── Sleep time buttons 2×2 ─────────────────────────
+                          - button:
+                              id: sleep_btn_5
+                              x: 8
+                              y: 38
+                              width: 90
+                              height: 38
+                              radius: 10
+                              bg_color: 0x1A3A50
+                              border_color: 0xF4A900
+                              border_width: 2
+                              shadow_opa: transp
+                              on_click:
+                                - globals.set:
+                                    id: user_sleep_minutes
+                                    value: '5'
+                                - number.set:
+                                    id: display_timeout_backlight
+                                    value: 5
+                                - lambda: |-
+                                    lv_obj_set_style_bg_color(id(sleep_btn_5),  lv_color_hex(0x1A3A50), LV_PART_MAIN);
+                                    lv_obj_set_style_bg_color(id(sleep_btn_10), lv_color_hex(0x2A2B3A), LV_PART_MAIN);
+                                    lv_obj_set_style_bg_color(id(sleep_btn_15), lv_color_hex(0x2A2B3A), LV_PART_MAIN);
+                                    lv_obj_set_style_bg_color(id(sleep_btn_30), lv_color_hex(0x2A2B3A), LV_PART_MAIN);
+                              widgets:
+                                - label:
+                                    align: center
+                                    text_font: nunito_16
+                                    text_color: 0xF4A900
+                                    text: "5 min"
+
+                          - button:
+                              id: sleep_btn_10
+                              x: 108
+                              y: 38
+                              width: 90
+                              height: 38
+                              radius: 10
+                              bg_color: 0x2A2B3A
+                              border_color: 0xF4A900
+                              border_width: 2
+                              shadow_opa: transp
+                              on_click:
+                                - globals.set:
+                                    id: user_sleep_minutes
+                                    value: '10'
+                                - number.set:
+                                    id: display_timeout_backlight
+                                    value: 10
+                                - lambda: |-
+                                    lv_obj_set_style_bg_color(id(sleep_btn_5),  lv_color_hex(0x2A2B3A), LV_PART_MAIN);
+                                    lv_obj_set_style_bg_color(id(sleep_btn_10), lv_color_hex(0x1A3A50), LV_PART_MAIN);
+                                    lv_obj_set_style_bg_color(id(sleep_btn_15), lv_color_hex(0x2A2B3A), LV_PART_MAIN);
+                                    lv_obj_set_style_bg_color(id(sleep_btn_30), lv_color_hex(0x2A2B3A), LV_PART_MAIN);
+                              widgets:
+                                - label:
+                                    align: center
+                                    text_font: nunito_16
+                                    text_color: 0x9BA2BC
+                                    text: "10 min"
+
+                          - button:
+                              id: sleep_btn_15
+                              x: 8
+                              y: 84
+                              width: 90
+                              height: 38
+                              radius: 10
+                              bg_color: 0x2A2B3A
+                              border_color: 0xF4A900
+                              border_width: 2
+                              shadow_opa: transp
+                              on_click:
+                                - globals.set:
+                                    id: user_sleep_minutes
+                                    value: '15'
+                                - number.set:
+                                    id: display_timeout_backlight
+                                    value: 15
+                                - lambda: |-
+                                    lv_obj_set_style_bg_color(id(sleep_btn_5),  lv_color_hex(0x2A2B3A), LV_PART_MAIN);
+                                    lv_obj_set_style_bg_color(id(sleep_btn_10), lv_color_hex(0x2A2B3A), LV_PART_MAIN);
+                                    lv_obj_set_style_bg_color(id(sleep_btn_15), lv_color_hex(0x1A3A50), LV_PART_MAIN);
+                                    lv_obj_set_style_bg_color(id(sleep_btn_30), lv_color_hex(0x2A2B3A), LV_PART_MAIN);
+                              widgets:
+                                - label:
+                                    align: center
+                                    text_font: nunito_16
+                                    text_color: 0x9BA2BC
+                                    text: "15 min"
+
+                          - button:
+                              id: sleep_btn_30
+                              x: 108
+                              y: 84
+                              width: 90
+                              height: 38
+                              radius: 10
+                              bg_color: 0x2A2B3A
+                              border_color: 0xF4A900
+                              border_width: 2
+                              shadow_opa: transp
+                              on_click:
+                                - globals.set:
+                                    id: user_sleep_minutes
+                                    value: '30'
+                                - number.set:
+                                    id: display_timeout_backlight
+                                    value: 30
+                                - lambda: |-
+                                    lv_obj_set_style_bg_color(id(sleep_btn_5),  lv_color_hex(0x2A2B3A), LV_PART_MAIN);
+                                    lv_obj_set_style_bg_color(id(sleep_btn_10), lv_color_hex(0x2A2B3A), LV_PART_MAIN);
+                                    lv_obj_set_style_bg_color(id(sleep_btn_15), lv_color_hex(0x2A2B3A), LV_PART_MAIN);
+                                    lv_obj_set_style_bg_color(id(sleep_btn_30), lv_color_hex(0x1A3A50), LV_PART_MAIN);
+                              widgets:
+                                - label:
+                                    align: center
+                                    text_font: nunito_16
+                                    text_color: 0x9BA2BC
+                                    text: "30 min"
+
+                          # Divider
+                          - obj:
+                              y: 132
+                              width: 190
+                              height: 1
+                              align: top_mid
+                              bg_color: 0x606682
+                              border_opa: transp
+                              shadow_opa: transp
+
+                          # ── Night mode row ─────────────────────────────────
+                          # Dims to 10% then fully off between 00:00 and 06:00
+                          # after 1 minute of idle.
+                          - label:
+                              x: 10
+                              y: 144
+                              align: top_left
+                              text_font: nunito_16
+                              text_color: 0x9BA2BC
+                              text: "Night mode"
+
+                          - button:
+                              id: night_mode_btn
+                              x: -10
+                              y: 138
+                              width: 38
+                              height: 38
+                              radius: 8
+                              align: top_right
+                              bg_opa: transp
+                              border_opa: transp
+                              shadow_opa: transp
+                              on_click:
+                                - lambda: |-
+                                    id(night_mode_enabled) = !id(night_mode_enabled);
+                                    bool en = id(night_mode_enabled);
+                                    // Update checkbox icon
+                                    lv_label_set_text(id(night_mode_icon),
+                                      en ? "\U000F0132" : "\U000F0131");
+                                    lv_obj_set_style_text_color(id(night_mode_icon),
+                                      lv_color_hex(en ? 0xF4A900 : 0x606682), LV_PART_MAIN);
+                                    // Apply immediately if in night hours
+                                    auto now = id(sntp_time).now();
+                                    if (now.is_valid()) {
+                                      auto call = id(display_timeout_backlight).make_call();
+                                      if (en && now.hour < 6) {
+                                        call.set_value(1);
+                                      } else {
+                                        call.set_value(id(user_sleep_minutes));
+                                      }
+                                      call.perform();
+                                    }
+                              widgets:
+                                - label:
+                                    id: night_mode_icon
+                                    align: center
+                                    text_font: mdi_icons_28
+                                    text_color: 0x606682
+                                    text: "\U000F0131"
+
+                          - label:
+                              x: 10
+                              y: 184
+                              align: top_left
+                              text_font: nunito_16
+                              text_color: 0x9BA2BC
+                              text: "00:00 - 06:00"
+
+        # ── Middle row card ────────────────────────────────────────────────
+        - obj:
+            id: middle_widget_background
+            y: 290
+            width: 440
+            height: 100
+            align: top_mid
+            clickable: false
+            scrollable: false
+            radius: 20
+            pad_all: 0
+            bg_color: 0x343645
+            border_opa: transp
+            shadow_opa: transp
+            widgets:
+
+              # HOME controls: lights btn + devices btn
+              - obj:
+                  id: middle_home_controls
+                  width: 440
+                  height: 100
+                  align: center
+                  clickable: false
+                  scrollable: false
+                  radius: 20
+                  pad_all: 0
+                  bg_opa: transp
+                  border_opa: transp
+                  shadow_opa: transp
+                  widgets:
+
+                    # Lights button (left)
+                    - obj:
+                        id: home_lights_btn_bg
+                        x: 30
+                        width: 90
+                        height: 90
+                        align: left_mid
+                        pad_all: 0
+                        bg_opa: transp
+                        shadow_opa: transp
+                        border_opa: transp
+                        widgets:
+                          - button:
+                              id: home_lights_btn
+                              width: 70
+                              height: 70
+                              align: center
+                              radius: 35
+                              pad_all: 0
+                              bg_opa: transp
+                              border_opa: transp
+                              shadow_width: 8
+                              shadow_spread: 2
+                              shadow_color: 0x0d0d0d
+                              shadow_opa: cover
+                              pressed:
+                                bg_color: 0x606682
+                                shadow_width: 4
+                              on_click:
+                                - lvgl.page.show: light_page
+                          - obj:
+                              width: 65
+                              height: 65
+                              align: center
+                              clickable: false
+                              radius: 32
+                              border_opa: transp
+                              bg_color: 0x343645
+                              widgets:
+                                - label:
+                                    align: center
+                                    text_font: mdi_icons_28
+                                    text_color: 0x9BA2BC
+                                    text: "\U000F18DD"
+
+                    # Climate / devices button (right)
+                    - obj:
+                        id: home_devices_btn_bg
+                        x: -30
+                        width: 90
+                        height: 90
+                        align: right_mid
+                        pad_all: 0
+                        bg_opa: transp
+                        shadow_opa: transp
+                        border_opa: transp
+                        widgets:
+                          - button:
+                              id: home_devices_btn
+                              width: 70
+                              height: 70
+                              align: center
+                              radius: 35
+                              pad_all: 0
+                              bg_opa: transp
+                              border_opa: transp
+                              shadow_width: 8
+                              shadow_spread: 2
+                              shadow_color: 0x0d0d0d
+                              shadow_opa: cover
+                              pressed:
+                                bg_color: 0x606682
+                                shadow_width: 4
+                              on_click:
+                                - lvgl.page.show: climate_page
+                          - obj:
+                              width: 65
+                              height: 65
+                              align: center
+                              clickable: false
+                              radius: 32
+                              border_opa: transp
+                              bg_color: 0x343645
+                              widgets:
+                                - label:
+                                    align: center
+                                    text_font: mdi_icons_28
+                                    text_color: 0x9BA2BC
+                                    text: "\U000F050F"
+
+              # WEATHER controls — empty, circle overlays this area
+              - obj:
+                  id: middle_weather_controls
+                  hidden: true
+                  width: 440
+                  height: 100
+                  align: center
+                  clickable: false
+                  radius: 20
+                  pad_all: 0
+                  bg_color: 0x343645
+                  border_opa: transp
+                  shadow_opa: transp
+
+        # ── Centre circle widget ───────────────────────────────────────────
+        # Black disc sits centred over the middle row
+        - obj:
+            id: circle_widget_background
+            y: 246
+            width: 150
+            height: 150
+            align: top_mid
+            clickable: false
+            scrollable: false
+            radius: 75
+            pad_all: 0
+            bg_color: 0x343645
+            border_opa: transp
+            shadow_opa: transp
+            widgets:
+
+              # HOME circle: hallway temp (red top arc) + outside temp (blue bottom arc)
+              - obj:
+                  id: circle_home_widget
+                  hidden: false
+                  width: 148
+                  height: 148
+                  align: center
+                  clickable: false
+                  scrollable: false
+                  radius: 74
+                  pad_all: 0
+                  bg_opa: transp
+                  border_opa: transp
+                  shadow_opa: transp
+                  widgets:
+                    - arc:
+                        id: circle_home_widget_temp_arc
+                        clickable: false
+                        adjustable: false
+                        align: center
+                        width: 128
+                        height: 128
+                        start_angle: 180
+                        end_angle: 360
+                        arc_width: 5
+                        arc_color: 0xff0000
+                        arc_rounded: false
+                        indicator:
+                          arc_opa: transp
+                    - arc:
+                        id: circle_home_widget_hum_arc
+                        clickable: false
+                        adjustable: false
+                        align: center
+                        width: 128
+                        height: 128
+                        start_angle: 0
+                        end_angle: 180
+                        arc_width: 5
+                        arc_color: 0x4C9FFF
+                        arc_rounded: false
+                        indicator:
+                          arc_opa: transp
+                    - obj:
+                        width: 98
+                        height: 98
+                        pad_all: 0
+                        align: center
+                        clickable: false
+                        scrollable: false
+                        radius: 49
+                        border_opa: transp
+                        bg_opa: transp
+                        widgets:
+                          - label:
+                              y: 12
+                              id: circle_home_temp_value
+                              align: top_mid
+                              text_font: nunito_20
+                              text_color: 0x9BA2BC
+                              text: "—°"
+                          - label:
+                              y: -12
+                              id: circle_home_outside_value
+                              align: bottom_mid
+                              text_font: nunito_20
+                              text_color: 0x9BA2BC
+                              text: "—°"
+                          - obj:
+                              width: 74
+                              height: 2
+                              align: center
+                              bg_color: 0x9BA2BC
+                              border_opa: transp
+                              shadow_opa: transp
+
+              # INFO circle: CPU temp with yellow arc
+              - obj:
+                  id: circle_info_widget
+                  hidden: true
+                  width: 148
+                  height: 148
+                  align: center
+                  clickable: false
+                  scrollable: false
+                  radius: 74
+                  pad_all: 0
+                  bg_opa: transp
+                  border_opa: transp
+                  shadow_opa: transp
+                  widgets:
+                    - arc:
+                        id: circle_info_cpu_arc
+                        clickable: false
+                        adjustable: false
+                        align: center
+                        width: 128
+                        height: 128
+                        start_angle: 0
+                        end_angle: 360
+                        arc_width: 5
+                        arc_color: 0xe7c12c
+                        arc_rounded: false
+                        indicator:
+                          arc_opa: transp
+                    - obj:
+                        width: 98
+                        height: 98
+                        pad_all: 0
+                        align: center
+                        clickable: false
+                        scrollable: false
+                        radius: 49
+                        border_opa: transp
+                        bg_opa: transp
+                        widgets:
+                          - label:
+                              y: 12
+                              align: top_mid
+                              text_font: nunito_20
+                              text_color: 0x9BA2BC
+                              text: "CPU"
+                          - label:
+                              y: -12
+                              id: circle_info_cpu_value
+                              align: bottom_mid
+                              text_font: nunito_20
+                              text_color: 0x9BA2BC
+                              text: "—°"
+                          - obj:
+                              width: 74
+                              height: 2
+                              align: center
+                              bg_color: 0x9BA2BC
+                              border_opa: transp
+                              shadow_opa: transp
+
+        # ── Weather image — declared last so it always renders on top ─────────
+        # y=62 sits it at the top edge of the main card, aligned centre.
+        # Being last in the widget list = highest z-order = never hidden behind
+        # the middle card or circle widget.
+        - obj:
+            id: weather_state_images
+            hidden: false
+            y: 62
+            width: 110
+            height: 110
+            align: top_mid
+            clickable: false
+            radius: 0
+            pad_all: 0
+            bg_opa: transp
+            border_opa: transp
+            shadow_opa: transp
+            widgets:
+              - image:
+                  id: weather_sunny_image
+                  hidden: true
+                  y: 5
+                  align: top_mid
+                  src: sunny_img
+              - image:
+                  id: weather_clear_night_image
+                  hidden: true
+                  y: 5
+                  align: top_mid
+                  src: clear_night_img
+              - image:
+                  id: weather_cloudy_image
+                  hidden: true
+                  y: 5
+                  align: top_mid
+                  src: cloudy_img
+              - image:
+                  id: weather_partlycloudy_sun_image
+                  hidden: false
+                  y: 5
+                  align: top_mid
+                  src: partlycloudy_sun_img
+              - image:
+                  id: weather_partlycloudy_moon_image
+                  hidden: true
+                  y: 5
+                  align: top_mid
+                  src: partlycloudy_moon_img
+              - image:
+                  id: weather_rainy_image
+                  hidden: true
+                  y: 5
+                  align: top_mid
+                  src: rainy_img
+              - image:
+                  id: weather_pouring_image
+                  hidden: true
+                  y: 5
+                  align: top_mid
+                  src: pouring_img
+              - image:
+                  id: weather_snowy_image
+                  hidden: true
+                  y: 5
+                  align: top_mid
+                  src: snowy_img
+              - image:
+                  id: weather_snowy_rainy_image
+                  hidden: true
+                  y: 5
+                  align: top_mid
+                  src: snowy_rainy_img
+              - image:
+                  id: weather_fog_image
+                  hidden: true
+                  y: 5
+                  align: top_mid
+                  src: fog_img
+              - image:
+                  id: weather_hail_image
+                  hidden: true
+                  y: 5
+                  align: top_mid
+                  src: hail_img
+              - image:
+                  id: weather_lightning_image
+                  hidden: true
+                  y: 5
+                  align: top_mid
+                  src: lightning_img
+              - image:
+                  id: weather_lightning_rainy_image
+                  hidden: true
+                  y: 5
+                  align: top_mid
+                  src: lightning_rainy_img
+              - image:
+                  id: weather_windy_image
+                  hidden: true
+                  y: 5
+                  x: 5
+                  align: top_mid
+                  src: windy_img
+              - image:
+                  id: weather_windy_variant_image
+                  hidden: true
+                  y: 5
+                  align: top_mid
+                  src: windy_variant_img
+
+        # ── Bottom navigation bar ──────────────────────────────────────────
+        - obj:
+            id: menu_controls_background
+            x: 0
+            y: -20
+            width: 440
+            height: 60
+            pad_all: 0
+            align: bottom_mid
+            bg_color: 0x343645
+            shadow_opa: transp
+            border_opa: transp
+            radius: 20
+            widgets:
+
+              # Brightness off button
+              - button:
+                  id: backlight_brightness_off_btn
+                  x: 60
+                  width: 50
+                  height: 50
+                  align: left_mid
+                  bg_opa: transp
+                  shadow_opa: transp
+                  widgets:
+                    - label:
+                        align: center
+                        text_color: 0x9BA2BC
+                        text_font: mdi_icons_28
+                        text: "\U000F1A4D"
+                  on_click:
+                    - delay: 500ms
+                    - light.turn_off:
+                        id: display_backlight
+                        transition_length: 1s
+
+              # Home button
+              - button:
+                  id: home_widget_btn
+                  x: 110
+                  width: 50
+                  height: 50
+                  align: left_mid
+                  bg_opa: transp
+                  shadow_opa: transp
+                  widgets:
+                    - label:
+                        align: center
+                        text_color: 0x9BA2BC
+                        text_font: mdi_icons_28
+                        text: "\U000F06A1"
+                  on_click:
+                    - script.execute:
+                        id: switch_to_mode
+                        target_mode: 0
+
+              # Weather button
+              - button:
+                  id: weather_widget_btn
+                  x: -110
+                  width: 50
+                  height: 50
+                  align: right_mid
+                  bg_opa: transp
+                  shadow_opa: transp
+                  widgets:
+                    - label:
+                        align: center
+                        text_color: 0x9BA2BC
+                        text_font: mdi_icons_28
+                        text: "\U000F18F6"
+                  on_click:
+                    - script.execute:
+                        id: switch_to_mode
+                        target_mode: 1
+
+              # Info button
+              - button:
+                  id: info_widget_btn
+                  x: -60
+                  width: 50
+                  height: 50
+                  align: right_mid
+                  bg_opa: transp
+                  shadow_opa: transp
+                  widgets:
+                    - label:
+                        align: center
+                        text_color: 0x9BA2BC
+                        text_font: mdi_icons_28
+                        text: "\U000F1C70"
+                  on_click:
+                    - script.execute:
+                        id: switch_to_mode
+                        target_mode: 2
+
+              # Settings button
+              - button:
+                  id: settings_widget_btn
+                  x: -10
+                  width: 50
+                  height: 50
+                  align: right_mid
+                  bg_opa: transp
+                  shadow_opa: transp
+                  widgets:
+                    - label:
+                        align: center
+                        text_color: 0x9BA2BC
+                        text_font: mdi_icons_28
+                        text: "\U000F08BB"
+                  on_click:
+                    - script.execute:
+                        id: switch_to_mode
+                        target_mode: 3
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # LIGHT PAGE
+    # ══════════════════════════════════════════════════════════════════════════
+    #
+    #  Layout (480×480):
+    #
+    #   ┌──────────┐  ┌────────────────────────────────────────┐  y=50
+    #   │          │  │  ○  Lounge Lamp                        │
+    #   │  ☀       │  └────────────────────────────────────────┘  y=156
+    #   │          │  ┌────────────────────────────────────────┐
+    #   │  slider  │  │  ○  Lounge Main                        │
+    #   │  (amber) │  └────────────────────────────────────────┘  y=262
+    #   │          │  ┌────────────────────────────────────────┐
+    #   │          │  │  ○  Display Case                       │
+    #   └──────────┘  └────────────────────────────────────────┘  y=368
+    #   x=14 w=90          x=118  w=348
+    #
+    #  Circle border glows blue when that light owns the slider.
+    #  Bulb icon glows amber when light is on, steel when off.
+    #  Tapping toggles the light AND selects it for brightness control.
+    #
+    - id: light_page
+      bg_color: 0x0d0d0d
+      scrollable: false
+      widgets:
+
+        # ── Brightness slider panel ───────────────────────────────────────────
+        - obj:
+            id: light_brightness_background
+            x: 14
+            y: 50
+            width: 90
+            height: 370
+            align: top_left
+            radius: 20
+            bg_color: 0x2A2B3A
+            pad_all: 0
+            scrollable: false
+            border_opa: transp
+            shadow_opa: transp
+            widgets:
+              - slider:
+                  id: light_brightness_slider
+                  align: center
+                  y: 0
+                  radius: 14
+                  width: 44
+                  height: 320
+                  min_value: 0
+                  max_value: 100
+                  value: 100
+                  bg_color: 0x606682
+                  indicator:
+                    bg_color: 0xF4A900
+                    radius: 14
+                  knob:
+                    bg_color: 0xf2f0eb
+                    radius: 14
+                    pad_all: 2
+                  on_release:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data_template:
+                          entity_id: !lambda |-
+                            static const char* ents[] = {
+                              "light.lounge_lamp",
+                              "light.lounge_main",
+                              "light.display_display_case"
+                            };
+                            return ents[id(selected_light_idx)];
+                          brightness: !lambda return (int)(x * 2.55f);
+
+        # ── Light card 0: Lounge Lamp ─────────────────────────────────────────
+        - obj:
+            id: light_card_0
+            x: 118
+            y: 50
+            width: 348
+            height: 96
+            align: top_left
+            radius: 18
+            bg_color: 0x2A2B3A
+            scrollable: false
+            border_opa: transp
+            shadow_opa: transp
+            widgets:
+              # Bulb icon button — toggles light on/off only
+              - button:
+                  id: light_btn_0
+                  x: 18
+                  align: left_mid
+                  width: 60
+                  height: 60
+                  radius: 30
+                  bg_color: 0x343645
+                  border_color: 0x3FA7F3
+                  border_width: 3
+                  border_opa: cover
+                  shadow_opa: transp
+                  on_click:
+                    - homeassistant.service:
+                        service: light.toggle
+                        data:
+                          entity_id: light.lounge_lamp
+                  widgets:
+                    - label:
+                        id: light_btn_0_icon
+                        align: center
+                        text_font: icons_28
+                        text_color: 0x606682
+                        text: "\U0000e908"
+              # Label tap area — selects this light for brightness control
+              - obj:
+                  x: 96
+                  align: left_mid
+                  width: 220
+                  height: 60
+                  radius: 8
+                  bg_opa: transp
+                  border_opa: transp
+                  shadow_opa: transp
+                  scrollable: false
+                  clickable: true
+                  on_click:
+                    - globals.set:
+                        id: selected_light_idx
+                        value: "0"
+                    - lambda: |-
+                        lv_obj_set_style_border_opa(id(light_btn_0), LV_OPA_COVER, LV_PART_MAIN);
+                        lv_obj_set_style_border_opa(id(light_btn_1), LV_OPA_TRANSP, LV_PART_MAIN);
+                        lv_obj_set_style_border_opa(id(light_btn_2), LV_OPA_TRANSP, LV_PART_MAIN);
+                  widgets:
+                    - label:
+                        align: left_mid
+                        x: 8
+                        text_font: nunito_20
+                        text_color: 0x9BA2BC
+                        text: "Lounge Lamp"
+
+        # ── Light card 1: Lounge Main ─────────────────────────────────────────
+        - obj:
+            id: light_card_1
+            x: 118
+            y: 156
+            width: 348
+            height: 96
+            align: top_left
+            radius: 18
+            bg_color: 0x2A2B3A
+            scrollable: false
+            border_opa: transp
+            shadow_opa: transp
+            widgets:
+              - button:
+                  id: light_btn_1
+                  x: 18
+                  align: left_mid
+                  width: 60
+                  height: 60
+                  radius: 30
+                  bg_color: 0x343645
+                  border_color: 0x3FA7F3
+                  border_width: 3
+                  border_opa: transp
+                  shadow_opa: transp
+                  on_click:
+                    - homeassistant.service:
+                        service: light.toggle
+                        data:
+                          entity_id: light.lounge_main
+                  widgets:
+                    - label:
+                        id: light_btn_1_icon
+                        align: center
+                        text_font: icons_28
+                        text_color: 0x606682
+                        text: "\U0000e908"
+              - obj:
+                  x: 96
+                  align: left_mid
+                  width: 220
+                  height: 60
+                  radius: 8
+                  bg_opa: transp
+                  border_opa: transp
+                  shadow_opa: transp
+                  scrollable: false
+                  clickable: true
+                  on_click:
+                    - globals.set:
+                        id: selected_light_idx
+                        value: "1"
+                    - lambda: |-
+                        lv_obj_set_style_border_opa(id(light_btn_0), LV_OPA_TRANSP, LV_PART_MAIN);
+                        lv_obj_set_style_border_opa(id(light_btn_1), LV_OPA_COVER, LV_PART_MAIN);
+                        lv_obj_set_style_border_opa(id(light_btn_2), LV_OPA_TRANSP, LV_PART_MAIN);
+                  widgets:
+                    - label:
+                        align: left_mid
+                        x: 8
+                        text_font: nunito_20
+                        text_color: 0x9BA2BC
+                        text: "Lounge Main"
+
+        # ── Light card 2: Display Case ────────────────────────────────────────
+        - obj:
+            id: light_card_2
+            x: 118
+            y: 262
+            width: 348
+            height: 96
+            align: top_left
+            radius: 18
+            bg_color: 0x2A2B3A
+            scrollable: false
+            border_opa: transp
+            shadow_opa: transp
+            widgets:
+              - button:
+                  id: light_btn_2
+                  x: 18
+                  align: left_mid
+                  width: 60
+                  height: 60
+                  radius: 30
+                  bg_color: 0x343645
+                  border_color: 0x3FA7F3
+                  border_width: 3
+                  border_opa: transp
+                  shadow_opa: transp
+                  on_click:
+                    - homeassistant.service:
+                        service: light.toggle
+                        data:
+                          entity_id: light.display_display_case
+                  widgets:
+                    - label:
+                        id: light_btn_2_icon
+                        align: center
+                        text_font: icons_28
+                        text_color: 0x606682
+                        text: "\U0000e908"
+              - obj:
+                  x: 96
+                  align: left_mid
+                  width: 220
+                  height: 60
+                  radius: 8
+                  bg_opa: transp
+                  border_opa: transp
+                  shadow_opa: transp
+                  scrollable: false
+                  clickable: true
+                  on_click:
+                    - globals.set:
+                        id: selected_light_idx
+                        value: "2"
+                    - lambda: |-
+                        lv_obj_set_style_border_opa(id(light_btn_0), LV_OPA_TRANSP, LV_PART_MAIN);
+                        lv_obj_set_style_border_opa(id(light_btn_1), LV_OPA_TRANSP, LV_PART_MAIN);
+                        lv_obj_set_style_border_opa(id(light_btn_2), LV_OPA_COVER, LV_PART_MAIN);
+                  widgets:
+                    - label:
+                        align: left_mid
+                        x: 8
+                        text_font: nunito_20
+                        text_color: 0x9BA2BC
+                        text: "Display Case"
+
+        # ── Back button ───────────────────────────────────────────────────────
+        - button:
+            id: light_back_btn
+            y: -14
+            width: 160
+            height: 44
+            radius: 22
+            align: bottom_mid
+            bg_color: 0x2A2B3A
+            border_opa: transp
+            shadow_opa: transp
+            on_click:
+              - lvgl.page.show:
+                  id: home_page
+                  animation: FADE_IN
+                  time: 200ms
+            widgets:
+              - label:
+                  align: center
+                  text_font: nunito_18
+                  text_color: 0x9BA2BC
+                  text: "Back"
+
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CLIMATE PAGE  — Hallway thermostat
+    # ══════════════════════════════════════════════════════════════════════════
+    - id: climate_page
+      bg_color: 0x343645
+      scrollable: false
+      widgets:
+
+        # ── Mode state label ──────────────────────────────────────────────────
+        - label:
+            id: climate_state_label
+            x: 110
+            y: 40
+            align: top_left
+            text_font: nunito_20
+            text_color: 0x9BA2BC
+            text: "—"
+
+        # ── HVAC mode buttons (left column, absolute y positions) ─────────────
+        - button:
+            id: climate_heat_mode_btn
+            x: 20
+            y: 90
+            width: 60
+            height: 60
+            align: top_left
+            radius: 30
+            bg_color: 0x2A2B3A
+            border_opa: transp
+            shadow_opa: transp
+            on_press:
+              - homeassistant.service:
+                  service: climate.set_hvac_mode
+                  data:
+                    entity_id: climate.hallway
+                    hvac_mode: heat
+            widgets:
+              - label:
+                  id: climate_heat_mode_icon
+                  align: center
+                  text_font: mdi_icons_28
+                  text_color: 0x9BA2BC
+                  text: "\U000F0238"
+
+        - button:
+            id: climate_off_mode_btn
+            x: 20
+            y: 170
+            width: 60
+            height: 60
+            align: top_left
+            radius: 30
+            bg_color: 0x2A2B3A
+            border_opa: transp
+            shadow_opa: transp
+            on_press:
+              - homeassistant.service:
+                  service: climate.set_hvac_mode
+                  data:
+                    entity_id: climate.hallway
+                    hvac_mode: "off"
+            widgets:
+              - label:
+                  id: climate_off_mode_icon
+                  align: center
+                  text_font: mdi_icons_28
+                  text_color: 0x9BA2BC
+                  text: "\U000F0425"
+
+        # ── + button ──────────────────────────────────────────────────────────
+        - button:
+            id: climate_plus_btn
+            x: 14
+            y: 270
+            width: 72
+            height: 72
+            align: top_left
+            radius: 36
+            bg_color: 0x2A2B3A
+            border_opa: transp
+            shadow_opa: transp
+            on_click:
+              - lambda: |-
+                  float t = id(target_setpoint) + 0.5f;
+                  if (t > 30.0f) t = 30.0f;
+                  id(target_setpoint) = t;
+                  char tbuf[8];
+                  snprintf(tbuf, sizeof(tbuf), "%.1f", t);
+                  lv_label_set_text(id(climate_target_temperature_label), tbuf);
+                  lv_arc_set_value(id(climate_arc_base_heat), (int)(t * 2 + 0.5f));
+              - homeassistant.service:
+                  service: climate.set_temperature
+                  data:
+                    entity_id: climate.hallway
+                  data_template:
+                    temperature: !lambda "return id(target_setpoint);"
+            widgets:
+              - label:
+                  id: climate_plus_label
+                  align: center
+                  text_font: mdi_icons_40
+                  text_color: 0x9BA2BC
+                  text: "\U000F0415"
+
+        # ── − button ──────────────────────────────────────────────────────────
+        - button:
+            id: climate_minus_btn
+            x: 14
+            y: 360
+            width: 72
+            height: 72
+            align: top_left
+            radius: 36
+            bg_color: 0x2A2B3A
+            border_opa: transp
+            shadow_opa: transp
+            on_click:
+              - lambda: |-
+                  float t = id(target_setpoint) - 0.5f;
+                  if (t < 10.0f) t = 10.0f;
+                  id(target_setpoint) = t;
+                  char tbuf[8];
+                  snprintf(tbuf, sizeof(tbuf), "%.1f", t);
+                  lv_label_set_text(id(climate_target_temperature_label), tbuf);
+                  lv_arc_set_value(id(climate_arc_base_heat), (int)(t * 2 + 0.5f));
+              - homeassistant.service:
+                  service: climate.set_temperature
+                  data:
+                    entity_id: climate.hallway
+                  data_template:
+                    temperature: !lambda "return id(target_setpoint);"
+            widgets:
+              - label:
+                  id: climate_minus_label
+                  align: center
+                  text_font: mdi_icons_40
+                  text_color: 0x9BA2BC
+                  text: "\U000F0374"
+
+        # ── Arc dial (right side) ─────────────────────────────────────────────
+        # x=100 positions the container so the arc stays fully on screen.
+        # Arcs are 370x370 — centred in the 380x480 container they stay within
+        # bounds without any clipping.
+        - obj:
+            x: 100
+            y: 0
+            width: 380
+            height: 480
+            align: top_left
+            pad_all: 0
+            bg_opa: transp
+            border_opa: transp
+            shadow_opa: transp
+            clickable: false
+            widgets:
+
+              # Background disc
+              - obj:
+                  width: 340
+                  height: 340
+                  align: center
+                  clickable: false
+                  radius: 170
+                  bg_color: 0x2E2F3E
+                  border_color: 0xf2f0eb
+                  border_width: 2
+                  border_opa: 15%
+
+              # Full-sweep background arc in steel
+              # start_angle=110 (lower-left, 20° past bottom clockwise)
+              # end_angle=70   (lower-right, 20° before bottom)
+              # → 320° sweep, 40° gap centred at the very bottom
+              - arc:
+                  id: climate_arc_background
+                  clickable: false
+                  adjustable: false
+                  align: center
+                  width: 370
+                  height: 370
+                  start_angle: 110
+                  end_angle: 70
+                  min_value: 20
+                  max_value: 60
+                  value: 60
+                  arc_width: 30
+                  arc_color: 0x606682
+                  indicator:
+                    arc_opa: transp
+                    arc_width: 30
+
+              # Current temp dot knob
+              - arc:
+                  id: climate_arc_current_temperature
+                  clickable: false
+                  adjustable: false
+                  align: center
+                  width: 370
+                  height: 370
+                  start_angle: 110
+                  end_angle: 70
+                  min_value: 20
+                  max_value: 60
+                  value: 40
+                  arc_width: 30
+                  arc_opa: transp
+                  indicator:
+                    arc_opa: transp
+                    arc_width: 30
+                  knob:
+                    pad_all: -10
+                    bg_color: 0x9BA2BC
+
+              # Heat arc (amber, draggable setpoint)
+              - arc:
+                  id: climate_arc_base_heat
+                  clickable: true
+                  adjustable: true
+                  adv_hittest: true
+                  align: center
+                  width: 370
+                  height: 370
+                  start_angle: 110
+                  end_angle: 70
+                  min_value: 20
+                  max_value: 60
+                  value: 40
+                  arc_width: 30
+                  arc_opa: transp
+                  indicator:
+                    arc_color: 0xFF6600
+                    arc_width: 30
+                  knob:
+                    pad_all: -2
+                    bg_color: 0xf2f0eb
+                    border_color: 0xFF6600
+                    border_width: 4
+                  on_value:
+                    - lambda: |-
+                        float temp = x / 2.0f;
+                        id(target_setpoint) = temp;
+                        char tbuf[8];
+                        snprintf(tbuf, sizeof(tbuf), "%.1f", temp);
+                        lv_label_set_text(id(climate_target_temperature_label), tbuf);
+                  on_release:
+                    - homeassistant.service:
+                        service: climate.set_temperature
+                        data:
+                          entity_id: climate.hallway
+                        data_template:
+                          temperature: !lambda "return id(target_setpoint);"
+
+              # Target temperature — single label, no baseline misalignment
+              - label:
+                  id: climate_target_temperature_label
+                  align: center
+                  x: 0
+                  y: -22
+                  text_font: nunito_48
+                  text_color: 0xF4A900
+                  text: "20.0"
+                  text_align: center
+
+              # Current temperature
+              - label:
+                  id: climate_current_temperature_label
+                  align: center
+                  y: 52
+                  text_font: nunito_30
+                  text_color: 0x606682
+                  text: "—"
+
+        # ── Back button ───────────────────────────────────────────────────────
+        - button:
+            id: climate_back_btn
+            y: -14
+            width: 160
+            height: 44
+            radius: 22
+            align: bottom_mid
+            bg_color: 0x2A2B3A
+            border_opa: transp
+            shadow_opa: transp
+            on_click:
+              - lvgl.page.show:
+                  id: home_page
+                  animation: FADE_IN
+                  time: 200ms
+            widgets:
+              - label:
+                  align: center
+                  text_font: nunito_18
+                  text_color: 0x9BA2BC
+                  text: "Back"
