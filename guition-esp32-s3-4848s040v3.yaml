@@ -135,17 +135,17 @@ switch:
   - platform: gpio
     name: "Relay 1"
     id: relay_1
-    pin: { number: GPIO40, inverted: true }
+    pin: { number: GPIO40, inverted: false }
     restore_mode: RESTORE_DEFAULT_OFF
   - platform: gpio
     name: "Relay 2"
     id: relay_2
-    pin: { number: GPIO2, inverted: true }
+    pin: { number: GPIO2, inverted: false }
     restore_mode: RESTORE_DEFAULT_OFF
   - platform: gpio
     name: "Relay 3"
     id: relay_3
-    pin: { number: GPIO1, inverted: true }
+    pin: { number: GPIO1, inverted: false }
     restore_mode: RESTORE_DEFAULT_OFF
 
 # ─── HA Light state listeners ─────────────────────────────────────────────────
